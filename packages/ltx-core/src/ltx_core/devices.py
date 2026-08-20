@@ -36,6 +36,8 @@ def get_preferred_device(local_rank: int | None = None) -> torch.device:
         return torch.device("cuda", index)
     if is_mps_available():
         return torch.device("mps")
+    if torch.xpu.is_available():
+        return torch.device("xpu")
     return torch.device("cpu")
 
 

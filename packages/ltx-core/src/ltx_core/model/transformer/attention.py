@@ -264,6 +264,13 @@ def _sdpa_full_priority() -> PytorchAttention:
     cannot anticipate the variety of real call sites (e.g. broadcast key-only
     masks, large head dim), so we defer the choice to the dispatcher.
     """
+    if torch.xpu.is_available():
+        return PytorchAttention(
+            priority=[
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        )
     return PytorchAttention(priority=list(_SDPA_FULL_PRIORITY))
 
 
