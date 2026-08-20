@@ -5,17 +5,13 @@ ltx-kernels = { path = "packages/ltx-kernels", editable = true }
 
 [tool.uv]
 no-build-isolation-package = ["ltx-kernels"]
-# torch 2.13+cu132 pins nvidia-cudnn-cu13==9.20.0.48, which omits
-# libcudnn_engines_tensor_ir; the system/apt cuDNN is 9.21.1 and that soname
-# then resolves from /usr/lib, causing CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH.
-# Force a wheel that ships tensor_ir and matches the host cuDNN series.
-override-dependencies = ["nvidia-cudnn-cu13==9.21.1.3"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
-# ltx-kernels compiles CUDA extensions; keep it out of the workspace so a plain
-# `uv sync` never forces a CUDA toolchain. Opt in via the `kernels` group below.
-exclude = ["packages/ltx-kernels"]
+# ltx-kernels compiles CUDA extensions and ltx-trainer needs CUDA-only torchcodec;
+# keep both out of the workspace so a plain `uv sync` resolves only the XPU
+# pipeline stack (ltx-core + ltx-pipelines).
+exclude = ["packages/ltx-kernels", "packages/ltx-trainer"]
 
 [[tool.uv.index]]
 name = "pypi"
@@ -28,17 +24,7 @@ dev = [
     "pre-commit>=4.3.0",
     "ruff>=0.14.3",
     "pytest~=9.0",
-    # Match torch's cu132 index (see packages/ltx-core pyproject): kernel builds must use
-    # the venv nvcc, not a mismatched system toolkit (CI runners often ship CUDA 12.8).
-    # `cccl` provides <nv/target> (pulled by cuda_fp16.h); `nvcc` alone is not enough.
-    "cuda-toolkit[nvcc,cccl]==13.2.*; sys_platform == 'linux'",
-    "nvidia-cuda-nvcc==13.2.*; sys_platform == 'linux'",
-    "nvidia-cuda-cccl==13.2.*; sys_platform == 'linux'",
 ]
-# Opt-in compiled CUDA kernels (blockwise FP8/FP6 GEMM + multi-GPU all2all), built
-# editable from packages/ltx-kernels without build isolation (torch must already be
-# installed), CUDA host required. Install with `uv sync --group kernels`.
-kernels = ["ltx-kernels"]
 
 [tool.ruff]
 target-version = "py311"

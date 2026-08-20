@@ -63,6 +63,20 @@ In cases of GPU memory constraints, consider `--quantization fp8-cast --offload 
 
 This uses the distilled model and pipeline for fast results. For better quality or other capabilities, see [Models](#full-model-list) and [Pipelines](#available-pipelines).
 
+#### Launcher script
+
+A convenience wrapper, [`run_pipeline.sh`](run_pipeline.sh), invokes the distilled pipeline with the split-layout
+model paths pre-wired and the device auto-selected (XPU via `torch.xpu.is_available()`):
+
+```bash
+# Model root default: /home/acm/paul/models/ltx-2.5 (override with LTX_MODEL_ROOT)
+./run_pipeline.sh "A cinematic aerial shot of a mountain lake at sunrise" output.mp4 --num-frames 121 --seed 42
+```
+
+Any extra arguments are forwarded to `python -m ltx_pipelines.distilled`, so the full flag set (`--offload`,
+`--quantization`, `--image`, `--lora`, ...) works the same way. Set `PIPELINE=distilled` (default) to select the
+module. The script fails fast if any required model file is missing.
+
 ### Full Model List
 
 LTX-2.5 is the recommended model, and what the [Quick Start](#-quick-start) uses. Its weights are published as one file per component, so you download only the parts your pipeline needs.
