@@ -267,6 +267,7 @@ def _sdpa_full_priority() -> PytorchAttention:
     if torch.xpu.is_available():
         return PytorchAttention(
             priority=[
+                SDPBackend.FLASH_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION,
                 SDPBackend.MATH,
             ]

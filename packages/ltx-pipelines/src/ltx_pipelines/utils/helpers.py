@@ -10,7 +10,12 @@ from ltx_core.conditioning import (
     VideoConditionByLatentIndex,
     VideoGeneratedKeyframeSlots,
 )
-from ltx_core.devices import cleanup_accelerator_memory, cuda_activation_budget_bytes, get_preferred_device
+from ltx_core.devices import (
+    cleanup_accelerator_memory,
+    cuda_activation_budget_bytes,
+    get_preferred_device,
+    xpu_activation_budget_bytes,
+)
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae import encode_audio
 from ltx_core.model.transformer import Modality
@@ -103,7 +108,12 @@ def tiling_config_for_vae(
 
     if free_bytes is None:
         dev = device if device is not None else get_device()
-        free_bytes = cuda_activation_budget_bytes(dev) if dev.type == "cuda" and torch.cuda.is_available() else 0
+        if dev.type == "cuda" and torch.cuda.is_available():
+            free_bytes = cuda_activation_budget_bytes(dev)
+        elif dev.type == "xpu" and torch.xpu.is_available():
+            free_bytes = xpu_activation_budget_bytes(dev)
+        else:
+            free_bytes = 0
 
     return recommended_decode_tiling_config(
         **geometry,

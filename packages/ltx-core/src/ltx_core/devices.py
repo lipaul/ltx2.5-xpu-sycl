@@ -65,21 +65,25 @@ def highest_precision_float(device: DeviceSpec) -> torch.dtype:
 
 
 def synchronize_device(device: DeviceSpec = None) -> None:
-    """Synchronize CUDA or MPS work if the selected backend supports it."""
+    """Synchronize CUDA, MPS, or XPU work if the selected backend supports it."""
     resolved = resolve_device(device)
     if resolved.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(resolved)
     elif resolved.type == "mps" and is_mps_available():
         torch.mps.synchronize()
+    elif resolved.type == "xpu" and torch.xpu.is_available():
+        torch.xpu.synchronize(resolved)
 
 
 def empty_device_cache(device: DeviceSpec = None) -> None:
-    """Release cached allocator memory for CUDA or MPS."""
+    """Release cached allocator memory for CUDA, MPS, or XPU."""
     resolved = resolve_device(device)
     if resolved.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
     elif resolved.type == "mps" and is_mps_available():
         torch.mps.empty_cache()
+    elif resolved.type == "xpu" and torch.xpu.is_available():
+        torch.xpu.empty_cache()
 
 
 def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
@@ -102,8 +106,27 @@ def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
     return min(int(free_raw), under_fraction)
 
 
+def xpu_activation_budget_bytes(device: DeviceSpec = None) -> int:
+    """Bytes still available for new XPU allocations in this process.
+    Mirrors :func:`cuda_activation_budget_bytes` for the XPU backend, honoring
+    ``torch.xpu.get_per_process_memory_fraction``.
+    """
+    if not torch.xpu.is_available():
+        return 0
+    resolved = resolve_device(device)
+    if resolved.type != "xpu":
+        return 0
+    idx = resolved.index if resolved.index is not None else torch.xpu.current_device()
+    free_raw, _total_raw = torch.xpu.mem_get_info(idx)
+    props_total = torch.xpu.get_device_properties(idx).total_memory
+    fraction = torch.xpu.get_per_process_memory_fraction(idx)
+    reserved = torch.xpu.memory_reserved(idx)
+    under_fraction = max(0, int(fraction * props_total) - int(reserved))
+    return min(int(free_raw), under_fraction)
+
+
 def cleanup_accelerator_memory(device: DeviceSpec = None) -> None:
-    """Run Python GC and release CUDA/MPS allocator caches."""
+    """Run Python GC and release CUDA/MPS/XPU allocator caches."""
     gc.collect()
     empty_device_cache(device)
     synchronize_device(device)

@@ -61,6 +61,13 @@ uv run python -m ltx_pipelines.distilled \
 
 In cases of GPU memory constraints, consider `--quantization fp8-cast --offload {cpu, disk}`. See [additional flags](packages/ltx-pipelines/docs/installation.md#common-cli-flags).
 
+> **XPU note**: On a 32 GB Intel XPU the 22B distilled transformer (44 GB bf16 weights) does not fit in
+> GPU memory at once, and the weight-offload flags are **required**, not optional:
+> `--offload cpu` (needs ~36 GB RAM for pinned weights; `--offload disk` is the lowest-memory option).
+> The XPU runtime also ships with flash-attention support for bf16 that the pipeline now prioritizes, and
+> the XPU allocator cache is released between stages, so activations fit at 1536x1024/121f. Without
+> `--offload`, inference fails with `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`.
+
 This uses the distilled model and pipeline for fast results. For better quality or other capabilities, see [Models](#full-model-list) and [Pipelines](#available-pipelines).
 
 #### Launcher script
@@ -70,12 +77,17 @@ model paths pre-wired and the device auto-selected (XPU via `torch.xpu.is_availa
 
 ```bash
 # Model root default: /home/acm/paul/models/ltx-2.5 (override with LTX_MODEL_ROOT)
-./run_pipeline.sh "A cinematic aerial shot of a mountain lake at sunrise" output.mp4 --num-frames 121 --seed 42
+./run_pipeline.sh "A cinematic aerial shot of a mountain lake at sunrise" output.mp4 --num-frames 121 --seed 42 --offload cpu
 ```
 
 Any extra arguments are forwarded to `python -m ltx_pipelines.distilled`, so the full flag set (`--offload`,
 `--quantization`, `--image`, `--lora`, ...) works the same way. Set `PIPELINE=distilled` (default) to select the
 module. The script fails fast if any required model file is missing.
+
+> **XPU**: on a 32 GB XPU the 22B model must run with `--offload cpu` (or `--offload disk`) — the wrapper does
+> **not** add it for you, unlike `/home/acm/paul_arc/test/111/ltx-gen.sh`, which bakes in `--offload cpu
+> --quantization fp8-cast` and uses the conv VAE. Without `--offload` here the transformer load fails with
+> `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`.
 
 ### Full Model List
 
@@ -144,6 +156,9 @@ See **[LTX-2.3 models](MODELS-LTX-2.3.md)** for the full list.
 * **Use gradient estimation** - Reduce inference steps from 40 to 20-30 while maintaining quality (see [pipeline documentation](packages/ltx-pipelines/docs/optimization.md#denoising-loop-optimization))
 * **Skip memory cleanup** - If you have sufficient VRAM, disable automatic memory cleanup between stages for faster processing
 * **Choose single-stage pipeline** - Use `TI2VidOneStagePipeline` for faster generation when high resolution isn't required
+* **XPU-specific** - On Intel XPU the memory-efficient SDPA kernel is runtime-disabled; the pipeline now prioritizes
+  the XPU `FLASH_ATTENTION` backend for bf16 (memory ~0.17 GB vs the quadratic math fallback), and the sync/empty
+  helpers release the XPU allocator cache between stages. See [XPU runtime gotchas](AGENTS.md#runtime-gotchas).
 
 ## ✍️ Prompting for LTX-2
 
