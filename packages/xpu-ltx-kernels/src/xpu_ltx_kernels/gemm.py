@@ -56,7 +56,9 @@ def _dequantize_activations(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.
     sf = scales.reshape(-1)
     nblocks = h // 128
     sr, sc = scales.stride(0), scales.stride(1)
-    idx = torch.arange(b * s, device=scales.device)[:, None] * sr + torch.arange(nblocks, device=scales.device)[None, :] * sc
+    rows_idx = torch.arange(b * s, device=scales.device)[:, None] * sr
+    blk_idx = torch.arange(nblocks, device=scales.device)[None, :] * sc
+    idx = rows_idx + blk_idx
     scale_t = sf[idx]
     xf = x_fp8.float().reshape(b * s, nblocks, 128)
     return (xf * scale_t[:, :, None]).reshape(b, s, h).to(torch.bfloat16)

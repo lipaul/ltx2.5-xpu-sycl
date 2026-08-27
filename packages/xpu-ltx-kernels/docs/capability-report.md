@@ -1,7 +1,7 @@
 # XPU capability report (Arc Pro B60, oneAPI 2026.1)
 
 Probed on this machine: 20x Intel Arc Pro B60 (Xe2/Battlemage, 160 XMX each),
-~24 GB GDDR6, oneAPI 2026.1, torch 2.13.0+xpu (lmccl_xpu env, runtime
+~24 GB GDDR6, oneAPI 2026.1, torch 2.13.0+xpu in the uv venv (runtime
 intel-sycl-rt 2026.0.0).
 
 ## Toolchain (the hard-won recipe)
@@ -30,10 +30,10 @@ intel-sycl-rt 2026.0.0).
   avoid instantiating those scalar wrappers (they trigger when a scalar math
   function is called from ESIMD device code).
 - torch's own SYCL build path (`cpp_extension.load`) is not usable here: it
-  forces `-fsycl-host-compiler=c++` + its own header order, and the 2025.3.2
-  runtime (torch 2.12.0+xpu repo env) conflicts with the only installed
-  compiler (2026.1). Use the `lmccl_xpu` env (torch 2.13.0+xpu, runtime
-  2026.0.0) for kernel work.
+  forces `-fsycl-host-compiler=c++` + its own header order. The uv venv must
+  run torch 2.13.0+xpu (runtime 2026.0.0, libsycl.so.9) to match the installed
+  oneAPI 2026.1 compiler; the older torch 2.12.0+xpu wheel's 2025.3.2 runtime
+  cannot run extensions built by 2026.1.
 
 ## GEMM
 

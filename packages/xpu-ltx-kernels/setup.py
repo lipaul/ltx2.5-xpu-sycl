@@ -60,10 +60,13 @@ class SyclBuildExt(build_ext):
     """Custom build_ext that compiles SYCL sources with icpx."""
 
     def run(self) -> None:
+        import sysconfig  # noqa: PLC0415
         import torch  # noqa: PLC0415
 
         self.torch_include = Path(torch.__file__).parent / "include"
-        self.python_include = Path(sys.prefix) / "include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        # uv venvs ship no Python headers; resolve via sysconfig so the base
+        # interpreter's include dir is used.
+        self.python_include = Path(sysconfig.get_path("include"))
         self.sycl_home = Path(os.environ.get("SYCL_HOME", str(_find_sycl_home())))
         self.torch_lib = Path(torch.__file__).parent / "lib"
         super().run()

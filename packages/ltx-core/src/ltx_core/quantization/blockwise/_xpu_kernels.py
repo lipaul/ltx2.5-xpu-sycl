@@ -59,8 +59,19 @@ def blockwise_quantize_rms_fma(
 
 
 def gated_attention(attn_out: torch.Tensor, gate_logits: torch.Tensor) -> torch.Tensor:
-    """Gated attention: ``attn_out * sigmoid(gate_logits)``."""
-    return attn_out * torch.sigmoid(gate_logits.to(attn_out.dtype))
+    """Per-head gated attention: ``attn_out * 2*sigmoid(gate_logits)``.
+
+    Matches ``ltx_kernels`` ``run_gated_attention`` (quantize=False path): x is
+    ``[b, t, h]`` with ``h = nh * dim_head`` and one gate per (token, head);
+    gates use ``2*sigmoid`` so a zero-init gate is identity.
+    """
+    b, t, h = attn_out.shape
+    nh = gate_logits.shape[-1]
+    dh = h // nh
+    if gate_logits.dim() == 2:
+        gate_logits = gate_logits.view(b, t, nh)
+    gates = 2.0 * torch.sigmoid(gate_logits.float()).to(attn_out.dtype)
+    return (attn_out.view(b, t, nh, dh) * gates.unsqueeze(-1)).view(b, t, h)
 
 
 def blockwise_dequantize(payload: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
