@@ -1,0 +1,144 @@
+// XPU kernels for blockwise-FP8 weight storage + bf16 GEMM.
+//
+// B60 (Xe2) has no FP8 tensor cores, so the FP8 GEMM from ltx-kernels does not
+// map. Instead we keep the FP8 blockwise *storage* layout (2x weight memory
+// saving vs bf16) and dequantize to bf16 with an ESIMD kernel, then let
+// torch's oneDNN bf16 GEMM run at ~XMX peak (~95 TFLOPS, see
+// docs/capability-report.md).
+//
+// Kernels:
+//   fp8_quantize_blockwise(w [out,in] bf16, scale_max) -> (q fp8 [out,in], s fp32 [out/128,in/128])
+//   fp8_dequantize_blockwise(q fp8, s fp32) -> bf16 [out,in]
+
+#include <torch/extension.h>
+#include <ATen/xpu/XPUContext.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+
+namespace {
+inline sycl::queue& current_queue() {
+  static c10::xpu::XPUStream stream = c10::xpu::getCurrentXPUStream();
+  return stream;
+}
+
+constexpr int BLOCK = 128;
+
+// float -> fp8 e4m3fn (round-to-nearest-even, saturate), matching torch.
+inline uint8_t float_to_fp8_e4m3(float x) {
+  constexpr int exp_bias = 7;
+  uint32_t bits;
+  std::memcpy(&bits, &x, 4);
+  uint32_t sign = (bits >> 31) & 1;
+  int32_t exp = (int32_t)((bits >> 23) & 0xFF) - 127;
+  int32_t mant = bits & 0x7FFFFF;
+  if (exp > 8) {  // saturate to max normal / inf per e4m3 (max 448)
+    return (uint8_t)((sign << 7) | 0x7E);  // 1.75 * 2^8 -> 448 -> 0x7E (exp 8, mant all ones)
+  }
+  if (exp < -7) return (uint8_t)(sign << 7);  // flush to zero
+  // Normal value: new exponent field = exp + bias, mantissa top 3 bits.
+  int32_t newexp = exp + exp_bias;
+  uint32_t m = (mant + 0x1000) >> 12;  // RNE on the dropped 12 mantissa bits... (13 kept -> drop 12)
+  // e4m3 has 3 mantissa bits; fp32 has 23. Round the low 20 bits.
+  m = (mant + (1u << 19)) >> 20;
+  if (m == 8) { m = 7; newexp += 1; }
+  if (newexp > 15) { return (uint8_t)((sign << 7) | 0x7E); }
+  return (uint8_t)((sign << 7) | (newexp << 3) | m);
+}
+
+struct QuantizeKernel {
+  const sycl::ext::oneapi::bfloat16* w;
+  uint8_t* q;
+  float* scales;
+  int out_features;
+  int in_features;
+  float scale_max;
+  void operator()(sycl::nd_item<1> it) const {
+    // Each work-item handles one 128x128 block: out block = gi / (in/128), in block = gi % (in/128)
+    int nb_in = in_features / BLOCK;
+    int o_block = it.get_global_id(0) / nb_in;
+    int i_block = it.get_global_id(0) % nb_in;
+    // Load the block, find absmax, quantize.
+    float absmax = 0.0f;
+    for (int r = 0; r < BLOCK; r++) {
+      for (int c = 0; c < BLOCK; c++) {
+        float v = (float)w[(int64_t)(o_block * BLOCK + r) * in_features + i_block * BLOCK + c];
+        absmax = sycl::fmax(absmax, sycl::fabs(v));
+      }
+    }
+    float scale = (absmax > 0.0f) ? (scale_max / absmax) : 1.0f;
+    for (int r = 0; r < BLOCK; r++) {
+      for (int c = 0; c < BLOCK; c++) {
+        int64_t idx = (int64_t)(o_block * BLOCK + r) * in_features + i_block * BLOCK + c;
+        float v = (float)w[idx];
+        q[idx] = float_to_fp8_e4m3(v * scale);
+      }
+    }
+    scales[(int64_t)o_block * nb_in + i_block] = 1.0f / scale;
+  }
+};
+
+struct DequantizeKernel {
+  const uint8_t* q;
+  const float* scales;
+  sycl::ext::oneapi::bfloat16* out;
+  int out_features;
+  int in_features;
+  void operator()(sycl::nd_item<1> it) const {
+    int nb_in = in_features / BLOCK;
+    int64_t idx = it.get_global_id(0);
+    int64_t total = (int64_t)out_features * in_features;
+    if (idx >= total) return;
+    int r = idx / in_features;
+    int c = idx % in_features;
+    float s = scales[(int64_t)(r / BLOCK) * nb_in + (c / BLOCK)];
+    uint8_t b = q[idx];
+    // fp8 e4m3 -> float
+    int sign = (b >> 7) & 1;
+    int e = (b >> 3) & 0xF;
+    int m = b & 0x7;
+    float val;
+    if (e == 0) val = (float)m * 0.0078125f;  // 2^-7
+    else val = (float)(1 << 3 | m) * exp2f((float)(e - 7 - 3));
+    if (sign) val = -val;
+    out[idx] = (sycl::ext::oneapi::bfloat16)(val * s);
+  }
+};
+
+}  // namespace
+
+std::vector<torch::Tensor> fp8_quantize_pair(torch::Tensor w) {
+  TORCH_CHECK(w.is_xpu() && w.scalar_type() == torch::kBFloat16 && w.dim() == 2);
+  int out_features = w.size(0);
+  int in_features = w.size(1);
+  TORCH_CHECK(out_features % BLOCK == 0 && in_features % BLOCK == 0, "features must be multiples of 128");
+  int nb_in = in_features / BLOCK;
+  auto q = torch::empty({out_features, in_features}, w.options().dtype(torch::kUInt8));
+  auto scales = torch::empty({out_features / BLOCK, nb_in}, w.options().dtype(torch::kFloat32));
+  auto& qq = current_queue();
+  int64_t blocks = (int64_t)(out_features / BLOCK) * nb_in;
+  qq.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(sycl::range<1>(((blocks + 63) / 64) * 64), sycl::range<1>(64)),
+                   QuantizeKernel{(const sycl::ext::oneapi::bfloat16*)w.data_ptr(), (uint8_t*)q.data_ptr(),
+                                  (float*)scales.data_ptr(), out_features, in_features, 448.0f});
+  });
+  qq.wait_and_throw();
+  return {q.view(torch::kFloat8_e4m3fn), scales};
+}
+
+torch::Tensor fp8_dequantize_blockwise(torch::Tensor q, torch::Tensor scales) {
+  TORCH_CHECK(q.is_xpu() && q.scalar_type() == torch::kFloat8_e4m3fn && q.dim() == 2);
+  int out_features = q.size(0);
+  int in_features = q.size(1);
+  auto out = torch::empty({out_features, in_features}, q.options().dtype(torch::kBFloat16));
+  auto& qq = current_queue();
+  int64_t total = (int64_t)out_features * in_features;
+  qq.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(sycl::range<1>(((total + 255) / 256) * 256), sycl::range<1>(256)),
+                   DequantizeKernel{(const uint8_t*)q.data_ptr(), (const float*)scales.data_ptr(),
+                                    (sycl::ext::oneapi::bfloat16*)out.data_ptr(), out_features, in_features});
+  });
+  qq.wait_and_throw();
+  return out;
+}
+

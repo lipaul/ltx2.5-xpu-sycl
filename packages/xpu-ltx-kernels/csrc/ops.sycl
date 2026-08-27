@@ -1,0 +1,366 @@
+// XPU (Intel GPU) fused element ops for LTX inference.
+//
+// Plain-SYCL ports of the CUDA kernels in ltx-kernels/csrc/ops, kept
+// numerically faithful so the blockwise-quantization path can dispatch to
+// them on XPU. Reduction-heavy kernels (RMS norm) use subgroup + local-memory
+// reductions; pure bit-manipulation ops (FP6 pack) are simple element maps.
+//
+// Ops:
+//   fp6_pack(x [m,n] u8) -> [m, n*3/4] u8      drop e_1/e_2 bits, pack 4x6b -> 3B
+//   fp6_unpack(x [m,np] u8, orig_n) -> [m, orig_n] u8
+//   rms_norm_rope(x [*,h], cos [*,h], sin [*,h], weights [h]) -> [*,h] bf16
+//   rms_norm_split_rope(x [b,s,h], sin [b,n,s,d], cos [b,n,s,d], weights [h]) -> [b,s,h] bf16
+
+#include <torch/extension.h>
+#include <ATen/xpu/XPUContext.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+namespace {
+
+inline sycl::queue& current_queue() {
+  static c10::xpu::XPUStream stream = c10::xpu::getCurrentXPUStream();
+  return stream;
+}
+
+// ---------------------------------------------------------------------------
+// FP6 pack / unpack
+// ---------------------------------------------------------------------------
+
+// 8-bit layout: s e1 e2 e3 m1 m2 m3 m4 (bits 7..0) -> 6-bit: s e3 m1 m2 m3 m4
+inline uint8_t pack_8bit_to_6bit(uint8_t input) {
+  uint8_t sign = (input >> 7) & 0x1;
+  uint8_t e_3 = (input >> 4) & 0x1;
+  uint8_t mantissa = input & 0x0F;
+  return ((sign << 5) | (e_3 << 4) | mantissa) & 0x3F;
+}
+
+struct Fp6PackKernel {
+  const uint8_t* input;
+  uint8_t* output;
+  int m;
+  int n;
+  int n_packed;
+  void operator()(sycl::nd_item<2> it) const {
+    int row = it.get_global_id(0);
+    int col_group = it.get_global_id(1);
+    if (row >= m) return;
+    int input_col = col_group * 4;
+    if (input_col >= n) return;
+    int output_col = col_group * 3;
+    const uint8_t* input_row = input + (int64_t)row * n;
+    uint8_t* output_row = output + (int64_t)row * n_packed;
+    uint8_t v[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      v[i] = (input_col + i < n) ? pack_8bit_to_6bit(input_row[input_col + i]) : 0;
+    }
+    if (output_col < n_packed) output_row[output_col] = (v[0] << 2) | (v[1] >> 4);
+    if (output_col + 1 < n_packed) output_row[output_col + 1] = (v[1] << 4) | (v[2] >> 2);
+    if (output_col + 2 < n_packed) output_row[output_col + 2] = (v[2] << 6) | v[3];
+  }
+};
+
+inline uint8_t unpack_6bit_to_8bit(uint8_t input) {
+  input = input & 0x3F;
+  uint8_t sign = (input >> 5) & 0x1;
+  uint8_t e_3 = (input >> 4) & 0x1;
+  uint8_t mantissa = input & 0x0F;
+  return (sign << 7) | (e_3 << 4) | mantissa;
+}
+
+struct Fp6UnpackKernel {
+  const uint8_t* input;
+  uint8_t* output;
+  int m;
+  int n_packed;
+  int n;
+  void operator()(sycl::nd_item<2> it) const {
+    int row = it.get_global_id(0);
+    int col_group = it.get_global_id(1);
+    if (row >= m) return;
+    int input_col = col_group * 3;
+    if (input_col >= n_packed) return;
+    int output_col = col_group * 4;
+    const uint8_t* input_row = input + (int64_t)row * n_packed;
+    uint8_t* output_row = output + (int64_t)row * n;
+    uint8_t b[3];
+    b[0] = (input_col < n_packed) ? input_row[input_col] : 0;
+    b[1] = (input_col + 1 < n_packed) ? input_row[input_col + 1] : 0;
+    b[2] = (input_col + 2 < n_packed) ? input_row[input_col + 2] : 0;
+    uint8_t v[4];
+    v[0] = (b[0] >> 2) & 0x3F;
+    v[1] = ((b[0] << 4) | (b[1] >> 4)) & 0x3F;
+    v[2] = ((b[1] << 2) | (b[2] >> 6)) & 0x3F;
+    v[3] = b[2] & 0x3F;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      if (output_col + i < n) output_row[output_col + i] = unpack_6bit_to_8bit(v[i]);
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// RMS norm + interleaved RoPE
+// ---------------------------------------------------------------------------
+// One workgroup per row. Pair-aligned chunk per work-item (chunk always even,
+// so a work-item owns whole (i, i+1) pairs). Sum of squares reduced across the
+// group via subgroup reduction + a per-subgroup local buffer.
+
+struct RmsNormRopeKernel {
+  const sycl::ext::oneapi::bfloat16* x;
+  const sycl::ext::oneapi::bfloat16* cos_f;
+  const sycl::ext::oneapi::bfloat16* sin_f;
+  const sycl::ext::oneapi::bfloat16* weights;
+  sycl::ext::oneapi::bfloat16* out;
+  sycl::local_accessor<float, 1> scratch;
+  int rows;
+  int dim;
+  bool has_weights;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const int wg = it.get_local_range(0);
+    const int64_t gid = it.get_global_id(0);
+    const int64_t row = gid / (int64_t)wg;
+    const bool valid = row < (int64_t)rows;
+    const int tid = it.get_local_id(0);
+
+    const int64_t xbase = row * dim;
+    const int chunk = 2 * ((dim + 2 * wg - 1) / (2 * wg));
+    const int start = tid * chunk;
+    float v[64];
+    int cnt = 0;
+    float sum_sq = 0.0f;
+    for (int c = 0; c < chunk; c++) {
+      int idx = start + c;
+      if (idx < dim) {
+        float xv = (float)x[xbase + idx];
+        v[cnt++] = xv;
+        sum_sq += xv * xv;
+      }
+    }
+
+    scratch[tid] = sum_sq;
+    sycl::group_barrier(it.get_group());
+    for (int stride = wg / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) scratch[tid] += scratch[tid + stride];
+      sycl::group_barrier(it.get_group());
+    }
+    float total = scratch[0];
+    float inv_rms = sycl::rsqrt(total / (float)dim);
+
+    for (int c = 0; c < cnt; c++) {
+      int idx = start + c;
+      float xv = v[c];
+      xv *= inv_rms;
+      if (has_weights) xv *= (float)weights[idx];
+      // Interleaved RoPE: partner is the adjacent element (i xor 1).
+      float other = (c % 2 == 0) ? v[c + 1] : v[c - 1];
+      if (has_weights) other *= inv_rms * (float)weights[idx ^ 1];
+      else other *= inv_rms;
+      float c_f = (float)cos_f[xbase + idx];
+      float s_f = (float)sin_f[xbase + idx];
+      float res = (c % 2 == 0) ? (-other * s_f + xv * c_f) : (other * s_f + xv * c_f);
+      if (valid) out[xbase + idx] = (sycl::ext::oneapi::bfloat16)res;
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// RMS norm + split RoPE
+// ---------------------------------------------------------------------------
+// One workgroup per token row. threads_per_head threads per head, 8 elements
+// per thread (matches the CUDA kernel). Cross-half partners exchanged through
+// a local scratch buffer (correct regardless of subgroup boundaries).
+
+struct RmsNormSplitRopeKernel {
+  const sycl::ext::oneapi::bfloat16* x;
+  const sycl::ext::oneapi::bfloat16* cos_f;
+  const sycl::ext::oneapi::bfloat16* sin_f;
+  const sycl::ext::oneapi::bfloat16* weights;
+  sycl::ext::oneapi::bfloat16* out;
+  sycl::local_accessor<float, 1> scratch;
+  int s;   // seq len
+  int n;   // heads
+  int dim; // h = n * head (head = dim/n)
+  long cos_sb, cos_sn, cos_ss;
+  long sin_sb, sin_sn, sin_ss;
+  bool has_weights;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const int wg = it.get_local_range(0);
+    const int64_t gid = it.get_global_id(0);
+    const int token = (int)(gid / (int64_t)wg);  // row over b*s
+    const int tid = it.get_local_id(0);
+
+    // d = head width in elements = dim / n; threads_per_head = d / 8.
+    const int head = dim / n;
+    const int tph = head / 8;
+    const int b_idx = token / s;
+    const int t_idx = token % s;
+    const int head_idx = tid / tph;
+    const int idx_in_head = tid % tph;
+    const bool is_first_half = idx_in_head < (tph / 2);
+    const int lane = idx_in_head % (tph / 2);
+
+    const int64_t xbase = (int64_t)token * dim + tid * 8;
+    float xv[8];
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      float val = (float)x[xbase + i];
+      xv[i] = val;
+      sum_sq += val * val;
+    }
+    scratch[wg * 8 + tid] = sum_sq;
+    sycl::group_barrier(it.get_group());
+    for (int stride = wg / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) scratch[wg * 8 + tid] += scratch[wg * 8 + tid + stride];
+      sycl::group_barrier(it.get_group());
+    }
+    float total = scratch[wg * 8];
+    float inv_rms = sycl::rsqrt(total / (float)dim + 1e-6f);
+
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      xv[i] *= inv_rms;
+      if (has_weights) xv[i] *= (float)weights[tid * 8 + i];
+      scratch[tid * 8 + i] = xv[i];
+    }
+    sycl::group_barrier(it.get_group());
+
+    // Load freqs [b, n, s, d/2]: off = b*sb + head*sn + t*ss + lane*8 (+i).
+    long off = (long)b_idx * cos_sb + (long)head_idx * cos_sn + (long)t_idx * cos_ss + (long)lane * 8;
+    const sycl::ext::oneapi::bfloat16* cos_row = cos_f + off;
+    const sycl::ext::oneapi::bfloat16* sin_row = sin_f + (long)b_idx * sin_sb + (long)head_idx * sin_sn + (long)t_idx * sin_ss + (long)lane * 8;
+
+    const int partner = (tid ^ (tph / 2));
+    const float sign = is_first_half ? -1.0f : 1.0f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      float other = scratch[partner * 8 + i];
+      float c_f = (float)cos_row[i];
+      float s_f = (float)sin_row[i];
+      xv[i] = c_f * xv[i] + sign * s_f * other;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      out[xbase + i] = (sycl::ext::oneapi::bfloat16)xv[i];
+    }
+  }
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Host entry points
+// ---------------------------------------------------------------------------
+
+torch::Tensor fp6_pack(torch::Tensor x) {
+  TORCH_CHECK(x.is_xpu(), "x must be XPU");
+  TORCH_CHECK(x.scalar_type() == torch::kUInt8 || x.scalar_type() == torch::kFloat8_e4m3fn, "x must be uint8");
+  auto x_u8 = x.dim() == 2 ? x.contiguous() : x.reshape({-1, x.size(-1)}).contiguous();
+  int m = x_u8.size(0);
+  int n = x_u8.size(1);
+  int n_packed = (n * 3) / 4;
+  auto out = torch::empty({m, n_packed}, x_u8.options().dtype(torch::kUInt8));
+  auto& q = current_queue();
+  int threads = 256;
+  q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<2>(sycl::range<2>(m, ((n + 3) / 4 + threads - 1) / threads * threads),
+                                     sycl::range<2>(1, threads)),
+                   Fp6PackKernel{(const uint8_t*)x_u8.data_ptr(), (uint8_t*)out.data_ptr(), m, n, n_packed});
+  });
+  q.wait_and_throw();
+  return out;
+}
+
+torch::Tensor fp6_unpack(torch::Tensor x, int64_t original_n) {
+  TORCH_CHECK(x.is_xpu(), "x must be XPU");
+  TORCH_CHECK(x.scalar_type() == torch::kUInt8, "x must be uint8");
+  auto x_u8 = x.reshape({-1, x.size(-1)}).contiguous();
+  int m = x_u8.size(0);
+  int n_packed = x_u8.size(1);
+  int n = original_n;
+  auto out = torch::empty({m, n}, x_u8.options());
+  auto& q = current_queue();
+  int threads = 256;
+  q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<2>(sycl::range<2>(m, ((n + 3) / 4 + threads - 1) / threads * threads),
+                                     sycl::range<2>(1, threads)),
+                   Fp6UnpackKernel{(const uint8_t*)x_u8.data_ptr(), (uint8_t*)out.data_ptr(), m, n_packed, n});
+  });
+  q.wait_and_throw();
+  return out;
+}
+
+torch::Tensor rms_norm_rope(torch::Tensor x, torch::Tensor cos_freqs, torch::Tensor sin_freqs,
+                            c10::optional<torch::Tensor> weights) {
+  TORCH_CHECK(x.is_xpu(), "x must be XPU");
+  TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bf16");
+  const int dim = x.size(-1);
+  TORCH_CHECK(dim % 8 == 0, "dim must be a multiple of 8");
+  auto x2 = x.reshape({-1, dim});
+  auto cos2 = cos_freqs.reshape({-1, dim});
+  auto sin2 = sin_freqs.reshape({-1, dim});
+  int rows = x2.size(0);
+  auto out = torch::empty_like(x2);
+  auto& q = current_queue();
+  int wg = 128;
+  const sycl::ext::oneapi::bfloat16* w = weights.has_value() ? (const sycl::ext::oneapi::bfloat16*)weights->data_ptr() : nullptr;
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<float, 1> scratch(sycl::range<1>(wg), h);
+    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((int64_t)rows * wg), sycl::range<1>(wg)),
+                   RmsNormRopeKernel{(const sycl::ext::oneapi::bfloat16*)x2.data_ptr(), (const sycl::ext::oneapi::bfloat16*)cos2.data_ptr(),
+                                     (const sycl::ext::oneapi::bfloat16*)sin2.data_ptr(), w, (sycl::ext::oneapi::bfloat16*)out.data_ptr(),
+                                     scratch, rows, dim, weights.has_value()});
+  });
+  q.wait_and_throw();
+  return out.reshape(x.sizes());
+}
+
+torch::Tensor rms_norm_split_rope(torch::Tensor x, torch::Tensor sin_freqs, torch::Tensor cos_freqs,
+                                  c10::optional<torch::Tensor> weights) {
+  TORCH_CHECK(x.is_xpu(), "x must be XPU");
+  TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bf16");
+  TORCH_CHECK(x.dim() == 3, "x must be [b, s, h]");
+  int b = x.size(0);
+  int s = x.size(1);
+  int dim = x.size(2);
+  int n = cos_freqs.size(1);
+  int head = dim / n;
+  TORCH_CHECK(head % 8 == 0, "head width must be a multiple of 8");
+  int tph = head / 8;
+  int wg = n * tph;
+  TORCH_CHECK(wg % 32 == 0, "group size must be a multiple of the subgroup size");
+  auto out = torch::empty_like(x);
+  auto& q = current_queue();
+  const sycl::ext::oneapi::bfloat16* w = weights.has_value() ? (const sycl::ext::oneapi::bfloat16*)weights->data_ptr() : nullptr;
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<float, 1> scratch(sycl::range<1>(wg * 8 + wg / 16 + 2), h);
+    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((int64_t)b * s * wg), sycl::range<1>(wg)),
+                   RmsNormSplitRopeKernel{(const sycl::ext::oneapi::bfloat16*)x.data_ptr(), (const sycl::ext::oneapi::bfloat16*)cos_freqs.data_ptr(),
+                                          (const sycl::ext::oneapi::bfloat16*)sin_freqs.data_ptr(), w, (sycl::ext::oneapi::bfloat16*)out.data_ptr(),
+                                          scratch, s, n, dim, cos_freqs.stride(0), cos_freqs.stride(1), cos_freqs.stride(2),
+                                          sin_freqs.stride(0), sin_freqs.stride(1), sin_freqs.stride(2),
+                                          weights.has_value()});
+  });
+  q.wait_and_throw();
+  return out;
+}
+
+// Functions from csrc/gemm.sycl and csrc/vae.sycl (no PYBIND11_MODULE there).
+std::vector<torch::Tensor> fp8_quantize_pair(torch::Tensor w);
+torch::Tensor fp8_dequantize_blockwise(torch::Tensor q, torch::Tensor scales);
+torch::Tensor na3d(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                   int64_t kt, int64_t kh, int64_t kw, double scale);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("fp6_pack", &fp6_pack);
+  m.def("fp6_unpack", &fp6_unpack);
+  m.def("rms_norm_rope", &rms_norm_rope);
+  m.def("rms_norm_split_rope", &rms_norm_split_rope);
+  m.def("fp8_quantize_pair", &fp8_quantize_pair);
+  m.def("fp8_dequantize_blockwise", &fp8_dequantize_blockwise);
+  m.def("na3d", &na3d);
+}

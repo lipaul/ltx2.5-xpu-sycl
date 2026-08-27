@@ -24,6 +24,7 @@ class QuantizationKind(str, Enum):
     FP8_SCALED_MM = "fp8-scaled-mm"
     NVFP4_CAST = "nvfp4-cast"
     NVFP4_PREQUANT = "nvfp4-prequant"
+    BLOCKWISE = "blockwise"
 
     def to_policy(self, checkpoint_path: str | None = None) -> QuantizationPolicy:
         """Build the :class:`QuantizationPolicy` for this kind.
@@ -46,5 +47,11 @@ class QuantizationKind(str, Enum):
                 if checkpoint_path is None:
                     raise ValueError(f"{self.value} quantization requires checkpoint_path.")
                 return build_nvfp4_prequant_policy(checkpoint_path, act_scale=ActScale.STATIC)
+            case QuantizationKind.BLOCKWISE:
+                # Blockwise FP8 (per-128-block scales). On XPU resolves to the
+                # SYCL/ESIMD kernels via ltx_core.quantization.blockwise.
+                from ltx_core.quantization.blockwise import build_fp8_policy  # noqa: PLC0415
+
+                return build_fp8_policy()
             case _:
                 assert_never(self)

@@ -681,8 +681,10 @@ def basic_arg_parser(
             "from the checkpoint's .weight_scale tensors. "
             "nvfp4-cast online-quantizes BF16 Linear weights to NVFP4 (Blackwell, ltx-kernels). "
             "nvfp4-prequant loads a pre-quantized NVFP4 checkpoint (pair with a BF16 VAE). "
+            "blockwise uses per-128-block FP8 weights (ltx-kernels on CUDA, "
+            "xpu-ltx-kernels on XPU). "
             "Example: --quantization fp8-cast, --quantization fp8-scaled-mm, "
-            "or --quantization nvfp4-prequant"
+            "or --quantization blockwise"
         ),
     )
     parser.add_argument(

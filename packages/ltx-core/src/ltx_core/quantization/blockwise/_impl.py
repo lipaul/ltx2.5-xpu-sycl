@@ -9,19 +9,81 @@ this module directly from non-quantization code.
 from typing import Callable, ClassVar, List, NamedTuple, Protocol, Type
 
 import torch
-from ltx_kernels.blockwise.functional import (
-    blockwise_dequantize,
-    blockwise_quantize_adanorm_triton,
-    blockwise_quantize_rms_fma_triton,
-    fp6_blockwise_quantize_weights_torch,
-    fp6_pack_tensor,
-    fp6_unpack_tensor,
-    fp8_blockwise_quantize_weights_torch,
-    gated_attention_triton,
-    rms_norm_rope,
-    rms_norm_split_rope,
-)
-from ltx_kernels.blockwise.linear import BlockwiseFP6Linear, BlockwiseFP8Linear
+
+# Kernel resolution: CUDA uses ltx-kernels (compiled CUDA extensions + Triton);
+# XPU uses xpu-ltx-kernels (SYCL/ESIMD ops) + torch fallbacks for the
+# Triton-only element ops. This keeps the whole module importable on either.
+try:
+    from ltx_kernels.blockwise.functional import (
+        blockwise_dequantize,
+        blockwise_quantize_adanorm_triton,
+        blockwise_quantize_rms_fma_triton,
+        fp6_blockwise_quantize_weights_torch,
+        fp6_pack_tensor,
+        fp6_unpack_tensor,
+        fp8_blockwise_quantize_weights_torch,
+        gated_attention_triton,
+        rms_norm_rope,
+        rms_norm_split_rope,
+    )
+    from ltx_kernels.blockwise.linear import BlockwiseFP6Linear, BlockwiseFP8Linear
+except ImportError:
+    from xpu_ltx_kernels.gemm import BlockwiseFP8Linear
+    from xpu_ltx_kernels.ops import fp6_pack_tensor, fp6_unpack_tensor, rms_norm_rope, rms_norm_split_rope
+
+    from ltx_core.quantization.blockwise._xpu_kernels import FP8_SCALE_MAX as _FP8_SCALE_MAX
+    from ltx_core.quantization.blockwise._xpu_kernels import (
+        blockwise_dequantize,
+        blockwise_quantize_adanorm,
+        blockwise_quantize_rms_fma,
+        gated_attention,
+    )
+
+    def fp8_blockwise_quantize_weights_torch(
+        x: torch.Tensor, block_size: int = 128
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _blockwise_quantize_weights_torch(x, block_size, _FP8_SCALE_MAX)
+
+    def fp6_blockwise_quantize_weights_torch(
+        x: torch.Tensor, block_size: int = 128
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _blockwise_quantize_weights_torch(x, block_size, 30.0)
+
+    def blockwise_quantize_adanorm_triton(
+        x: torch.Tensor,
+        w: torch.Tensor | None,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        out_dtype: torch.dtype,
+        hd_scale: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:  # type: ignore[no-redef]
+        return blockwise_quantize_adanorm(x, w, scale, shift, out_dtype, hd_scale)
+
+    def blockwise_quantize_rms_fma_triton(
+        x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:  # type: ignore[no-redef]
+        return blockwise_quantize_rms_fma(x, y, gate)
+
+    def gated_attention_triton(attn_out: torch.Tensor, gate_logits: torch.Tensor) -> torch.Tensor:  # type: ignore[no-redef]
+        return gated_attention(attn_out, gate_logits)
+
+    BlockwiseFP6Linear = BlockwiseFP8Linear  # FP6 storage unsupported on XPU; reuse fp8 linear
+
+    def _blockwise_quantize_weights_torch(
+        w: torch.Tensor, block_size: int, scale_max: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Torch blockwise weight quantize (matches ltx_kernels.blockwise_quantize_weights)."""
+        out, inn = w.shape
+        wb = w.float().view(out // block_size, block_size, inn // block_size, block_size)
+        absmax = wb.abs().amax(dim=(1, 3)).clamp_min(1e-8)
+        scale = scale_max / absmax
+        fp8_min = torch.finfo(torch.float8_e4m3fn).min
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        q = (wb * scale[:, None, :, None]).clamp(fp8_min, fp8_max).to(torch.float8_e4m3fn)
+        q = q.view(out, inn)
+        return q, (1.0 / scale).contiguous()
+
+
 from torch import nn
 
 from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule
@@ -111,7 +173,10 @@ def _replace_linear_modules(model: torch.nn.Module, linear_cls: Type[FromLinearP
             )
             del module.weight
             del module.bias
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.xpu.is_available():
+                torch.xpu.empty_cache()
     return model
 
 
@@ -126,7 +191,7 @@ def _blockwise_quantize_weight_helper(
     pack_fn: Callable[[torch.Tensor], torch.Tensor],
 ) -> BlockwiseQuantizedWeight:
     orig_device = value.device
-    w_quant, w_scales = quant_fn(value.cuda())
+    w_quant, w_scales = quant_fn(value.to(orig_device), 128)
     return BlockwiseQuantizedWeight(
         weight=pack_fn(w_quant).to(device=orig_device),
         scale=w_scales.to(device=orig_device),
@@ -294,7 +359,7 @@ def _blockwise_fp8_fuse(
     weight_scale = model_sd.sd[scale_key].to(device=weight.device)
     bf16_weight = _blockwise_dequantize_2d(weight, weight_scale)
     merged = bf16_weight + deltas.to(dtype=bf16_weight.dtype)
-    new_fp8_weight, new_weight_scale = fp8_blockwise_quantize_weights_torch(merged.cuda())
+    new_fp8_weight, new_weight_scale = fp8_blockwise_quantize_weights_torch(merged.to(device=weight.device))
     return {
         key: new_fp8_weight.to(device=weight.device),
         scale_key: new_weight_scale.to(device=weight.device),

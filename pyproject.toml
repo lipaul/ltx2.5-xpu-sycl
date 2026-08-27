@@ -11,7 +11,9 @@ members = ["packages/*"]
 # ltx-kernels compiles CUDA extensions and ltx-trainer needs CUDA-only torchcodec;
 # keep both out of the workspace so a plain `uv sync` resolves only the XPU
 # pipeline stack (ltx-core + ltx-pipelines).
-exclude = ["packages/ltx-kernels", "packages/ltx-trainer"]
+# xpu-ltx-kernels compiles SYCL/ESIMD extensions with icpx + a matching SYCL
+# runtime, so it is also excluded and installed opt-in (see its AGENTS.md/README).
+exclude = ["packages/ltx-kernels", "packages/ltx-trainer", "packages/xpu-ltx-kernels"]
 
 [[tool.uv.index]]
 name = "pypi"
@@ -76,6 +78,10 @@ ignore = [
 ".github/actions/golden-pairing-gate/check_golden_pairing.py" = ["T201"]
 # Emits `export …` lines for eval by kernels-build.
 ".github/actions/kernels-build/export_cuda_home.py" = ["T201"]
+# xpu-ltx-kernels: tensor-shape variables are conventionally uppercase (B, S, H,
+# D, T, W, NH, HD); tests keep the flat-test style of the rest of the repo.
+"packages/xpu-ltx-kernels/src/xpu_ltx_kernels/tests/**" = ["ANN001", "ANN201", "ANN202", "N806"]
+"packages/xpu-ltx-kernels/src/**" = ["N806"]
 # setup.py must set CUDA_HOME before importing torch.utils.cpp_extension.
 "packages/ltx-kernels/setup.py" = ["E402"]
 # Tests for the CuTe DSL kernels. ltx-kernels is an optional, CUDA-host-only install,

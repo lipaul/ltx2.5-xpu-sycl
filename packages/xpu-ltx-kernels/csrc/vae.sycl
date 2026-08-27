@@ -1,0 +1,107 @@
+// XPU 3D neighborhood attention for the DiffVAE decoder, matching natten's
+// semantics (clamped/shift-inward windows, [B,T,H,W,NH,HD] layout, scale
+// applied inside). Plain-SYCL; a functional backend for ltx-core's
+// `attention_function` swap surface on XPU (replaces Triton/eager fallbacks).
+//
+// `natten.na3d` semantics (mirrors ltx_core fallback_na/triton_na):
+//   per query (b,t,h,w,nh): window [t_lo,t_hi)x[h_lo,h_hi)x[w_lo,w_hi) with
+//   t_lo = min(max(t - kt//2, 0), T - kt), hi = lo + kt (non-causal).
+
+#include <torch/extension.h>
+#include <ATen/xpu/XPUContext.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+
+namespace {
+inline sycl::queue& current_queue() {
+  static c10::xpu::XPUStream stream = c10::xpu::getCurrentXPUStream();
+  return stream;
+}
+
+constexpr float NEG_INF = -3.402823466e+38f;
+
+struct Na3dKernel {
+  const sycl::ext::oneapi::bfloat16* q;
+  const sycl::ext::oneapi::bfloat16* k;
+  const sycl::ext::oneapi::bfloat16* v;
+  sycl::ext::oneapi::bfloat16* out;
+  int B, T, H, W, NH, HD;
+  int kt, kh, kw;
+  float scale;
+  long s_b, s_t, s_h, s_w, s_n;  // strides (elements)
+
+  void operator()(sycl::nd_item<1> it) const {
+    const int64_t gid = it.get_global_id(0);
+    const int64_t inner = (int64_t)T * H * W * NH;
+    if (gid >= inner * B) return;
+    const int b = (int)(gid / inner);
+    const int64_t qi = gid % inner;
+    int t = qi / (H * W * NH);
+    int64_t rem = qi % (H * W * NH);
+    int h = rem / (W * NH);
+    rem = rem % (W * NH);
+    int w = rem / NH;
+    int nh = rem % NH;
+
+    const int64_t base = (int64_t)b * s_b + (int64_t)t * s_t + (int64_t)h * s_h + (int64_t)w * s_w + (int64_t)nh * s_n;
+
+    int t_lo = sycl::min(sycl::max(t - kt / 2, 0), T - kt);
+    int h_lo = sycl::min(sycl::max(h - kh / 2, 0), H - kh);
+    int w_lo = sycl::min(sycl::max(w - kw / 2, 0), W - kw);
+
+    // load q row
+    float qv[64];
+    for (int d = 0; d < HD; d++) qv[d] = (float)q[base + d];
+
+    float m_i = NEG_INF, l_i = 0.0f;
+    float acc[64];
+    for (int d = 0; d < HD; d++) acc[d] = 0.0f;
+
+    for (int tk = t_lo; tk < t_lo + kt; tk++) {
+      for (int hk = h_lo; hk < h_lo + kh; hk++) {
+        const int64_t plane = (int64_t)tk * s_t + (int64_t)hk * s_h;
+        for (int wk = w_lo; wk < w_lo + kw; wk++) {
+          const int64_t kv_off = plane + (int64_t)wk * s_w + (int64_t)nh * s_n;
+          // score = q.k
+          float s = 0.0f;
+          for (int d = 0; d < HD; d++) s += qv[d] * (float)k[kv_off + d];
+          s *= scale;
+          float m_new = sycl::fmax(m_i, s);
+          float alpha = sycl::exp(m_i - m_new);
+          float p = sycl::exp(s - m_new);
+          l_i = l_i * alpha + p;
+          for (int d = 0; d < HD; d++) acc[d] = acc[d] * alpha + p * (float)v[kv_off + d];
+          m_i = m_new;
+        }
+      }
+    }
+    float inv = 1.0f / sycl::fmax(l_i, 1e-30f);
+    for (int d = 0; d < HD; d++) out[base + d] = (sycl::ext::oneapi::bfloat16)(acc[d] * inv);
+  }
+};
+
+}  // namespace
+
+torch::Tensor na3d(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                   int64_t kt, int64_t kh, int64_t kw, double scale) {
+  TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu(), "q/k/v must be XPU");
+  TORCH_CHECK(q.dim() == 6, "q must be [B,T,H,W,NH,HD]");
+  TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bf16");
+  int B = q.size(0), T = q.size(1), H = q.size(2), W = q.size(3), NH = q.size(4), HD = q.size(5);
+  TORCH_CHECK(HD <= 64, "HD must be <= 64");
+  auto out = torch::empty_like(q);
+  auto& qq = current_queue();
+  int64_t inner = (int64_t)T * H * W * NH;
+  qq.submit([&](sycl::handler& h) {
+    h.parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(((uint64_t)B * inner + 255) / 256 * 256), sycl::range<1>(256)),
+        Na3dKernel{(const sycl::ext::oneapi::bfloat16*)q.data_ptr(), (const sycl::ext::oneapi::bfloat16*)k.data_ptr(),
+                   (const sycl::ext::oneapi::bfloat16*)v.data_ptr(), (sycl::ext::oneapi::bfloat16*)out.data_ptr(),
+                   B, T, H, W, NH, HD, (int)kt, (int)kh, (int)kw, (float)scale,
+                   q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4)});
+  });
+  qq.wait_and_throw();
+  return out;
+}
+

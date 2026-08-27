@@ -3,6 +3,8 @@
 LTX-2: a PyTorch audio-video diffusion model. This working tree is a vendored snapshot of
 [`Lightricks/LTX-2`](https://github.com/Lightricks/LTX-2), pushed to a personal fork
 (`lipaul/ltx-2-xpu`, `git remote -v`). It is a `uv` workspace monorepo of four packages.
+The XPU support is the fork's divergence from upstream: the `ltx-core` torch pins, the XPU branches in
+`devices.py` and `attention.py`, and `run_pipeline.sh`. Preserve them when rebasing upstream changes.
 
 ## Per-package instruction files (read these first)
 
@@ -13,6 +15,13 @@ These already encode hard-won, repo-specific guidance. Read the relevant one bef
 - `packages/ltx-pipelines/CLAUDE.md` — inference pipelines: pipeline selection table, sigma schedules,
   LoRA conventions, `utils/blocks.py` memory model, DFR invariants, generated-keyframes rules.
 - `packages/ltx-kernels/README.md` and `packages/ltx-core/README.md` — CUDA extension layout and model components.
+- `packages/xpu-ltx-kernels/README.md` + `docs/capability-report.md` — the fork's XPU kernel
+  package (SYCL/ESIMD): the icpx build recipe (compile with `-x c++`, link with `icpx -shared -fsycl`
+  — skipping the device-link segfaults at kernel submission), the `lmccl_xpu` env requirement, and the
+  B60 hardware findings (no FP8 tensor cores, bf16 GEMM already at ~95 TFLOPS via oneDNN).
+- Any training / LoRA / fine-tuning request: the `train-model` skill
+  (`.claude/skills/train-model/SKILL.md`) is the orchestrator. The trainer is CUDA-only and excluded from
+  the XPU workspace, so do not expect a plain `uv sync` to install it.
 
 Keep changes to each package consistent with its own instruction file.
 
@@ -22,6 +31,14 @@ Keep changes to each package consistent with its own instruction file.
 - `packages/ltx-pipelines/` — ready-made inference pipelines (`ltx_pipelines.*`, run as `python -m ltx_pipelines.<module>`).
 - `packages/ltx-trainer/` — LoRA / full fine-tuning (`scripts/train.py`, `configs/*.yaml`).
 - `packages/ltx-kernels/` — optional CUDA/C++ extensions (all2all, blockwise FP8/FP6 GEMM, NVFP4, CuTe DSL VAE kernels).
+- `packages/xpu-ltx-kernels/` — the fork's XPU kernel package (SYCL/ESIMD, icpx): fused
+  `rms_norm_rope` / `rms_norm_split_rope`, FP6 pack, blockwise-FP8 storage + bf16 GEMM, VAE
+  neighborhood attention, all2all. Excluded from the uv workspace (needs icpx + a matching SYCL
+  runtime); install opt-in into the `lmccl_xpu` env (`pip install -e ... --no-build-isolation`).
+- `run_pipeline.sh` — the fork's inference launcher: runs the split-layout distilled pipeline on XPU with
+  pre-wired model paths (default model root `/home/acm/paul/models/ltx-2.5`, override `LTX_MODEL_ROOT`;
+  `PIPELINE=distilled` selects the module). Extra args forward to `python -m ltx_pipelines.distilled`; it does
+  **not** add `--offload`, which the 22B model still needs on a 32 GB XPU.
 
 ## Toolchain (uv + torch XPU)
 
@@ -36,9 +53,15 @@ against the official PyTorch **XPU** index — no CUDA.
 - **`transformers` is capped at `<5.15`** (in `ltx-core` deps). 5.15.0+ breaks the Gemma 4 text encoder build.
 - `ltx-core` bounds `requires-python = ">=3.10,<3.14"`: `triton-xpu==3.7.1` has no free-threaded 3.14
   (cp314t) Windows wheel, so an unbounded range makes the universal lock unresolvable.
-- **`ltx-trainer` and `ltx-kernels` are excluded from the uv workspace** (`[tool.uv.workspace].exclude`). The
-  trainer pins CUDA-only `torchcodec`; the kernels are CUDA extensions. A plain `uv sync` installs only
+- **`ltx-trainer`, `ltx-kernels`, and `xpu-ltx-kernels` are excluded from the uv workspace**
+  (`[tool.uv.workspace].exclude`). The trainer pins CUDA-only `torchcodec`; the kernels are CUDA
+  extensions; xpu-ltx-kernels needs the icpx/SYCL toolchain. A plain `uv sync` installs only
   `ltx-core` + `ltx-pipelines`, the pipeline stack.
+- **Custom XPU kernels must be built in the `lmccl_xpu` conda env** (torch 2.13.0+xpu, pip
+  `intel-sycl-rt` 2026.0.0), NOT the repo venv: the repo's torch 2.12.0+xpu bundles a 2025.3.2 SYCL
+  runtime that conflicts with the only installed compiler (oneAPI 2026.1), and torch's
+  `cpp_extension` SYCL path is unusable (forces `-fsycl-host-compiler`). Use icpx directly per
+  `packages/xpu-ltx-kernels/docs/capability-report.md`.
 - Fresh clone is shallow; `git fetch --unshallow origin` before pushing a branch that depends on full history.
 
 ## Code quality gates
@@ -52,6 +75,8 @@ uv run ruff format .
 ```
 
 There is **no `.pre-commit-config.yaml`** in this tree — `pre-commit run` is not a working gate; ruff is the gate.
+`packages/xpu-ltx-kernels/**` has per-file-ignores for tensor-shape uppercase naming (`B`, `S`, `H`, `D`) and
+test annotations, mirroring the CuTe DSL treatment.
 
 ## Runtime gotchas
 
@@ -82,6 +107,11 @@ There is **no `.pre-commit-config.yaml`** in this tree — `pre-commit run` is n
   with the `torch==2.12.0+xpu` pin).
 - Sourcing oneAPI (`/opt/intel/oneapi/setvars.sh`) is required before device tools (`xpu-smi`) see the GPU;
   `sycl-ls` is the reliable probe for the Level-Zero devices.
+- Custom kernel gotchas (see `packages/xpu-ltx-kernels/docs/capability-report.md`): oneAPI 2026.1 ESIMD
+  headers have N=1 scalar-math compile bugs; torch bf16 maps to `sycl::ext::oneapi::bfloat16` (not
+  `sycl::half`, which is fp16); subgroup `reduce_over_group` and local-memory atomics are unreliable on
+  this runtime — use barrier-tree reductions; one workgroup per row (never `global_id` as the row index);
+  no early-returns before a group reduction.
 
 ## Tests
 
