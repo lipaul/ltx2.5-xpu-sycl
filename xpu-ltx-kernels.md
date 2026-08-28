@@ -132,6 +132,25 @@ icpx -shared -fPIC -fsycl -o _C.so ops.o gemm.o vae.o \
 而是**让 22B 在 24 GB B60 免 offload 常驻推理**，端到端约 **1.9×**（stage 1 达 2.6×），
 同时省掉 ~36 GB 主机 RAM。
 
+### 可复现基准脚本（`reproduce_uv_bench.sh`）
+
+`./reproduce_uv_bench.sh` 一键复现整个流程并 A/B 两种模式：
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+./reproduce_uv_bench.sh                  # 33 帧完整对比
+FRAMES=9 ./reproduce_uv_bench.sh         # 快速冒烟（~5 分钟）
+LTX_MODEL_ROOT=/path/to/models ./reproduce_uv_bench.sh
+```
+
+脚本 5 步：① 预检（模型/uv/icpx，忽略 setvars 的 32 位库警告 rc=3）→ ② `uv sync`
+（XPU torch 钉）→ ③ icpx 构建 `xpu-ltx-kernels` 进 uv venv → ④ 同 prompt/seed/frames
+分别跑 `--offload cpu`（基线）与 `--quantization blockwise`（无 offload）→
+⑤ 从 tqdm 日志解析每阶段 s/it 与总耗时（自动外推最后一步），打印 speedup 表。
+输出与日志在 `build/bench/`（已 gitignore）。冒烟实测（B60, 9 帧）：
+stage 1 **5.54→1.55 s/it（3.76×）**、stage 2 5.39→3.38 s/it（1.60×）、去噪合计 **2.76×**，
+与 33 帧基准趋势一致。
+
 ## 7. 局限与后续
 
 - **block streaming 不支持 blockwise policy**（`blocks.py` 只放行 bf16/fp8_cast）——
@@ -148,4 +167,6 @@ icpx -shared -fPIC -fsycl -o _C.so ops.o gemm.o vae.o \
 - `f62fa47` Add xpu-ltx-kernels: SYCL/ESIMD XPU kernels for LTX inference（全部 5 阶段）
 - `4446160` Reproduce under uv: bump XPU torch pins to 2.13.0+xpu（含 gated_attention /
   BlockwiseFP8Linear 两处 e2e 修复 + 基准）
+- `77cdd48` Add xpu-ltx-kernels.md: full SYCL/ESIMD port + acceleration writeup（本文档）
+- `d6176bb` Add reproduce_uv_bench.sh: uv-sync + build + A/B performance script（一键复现基准）
 - 远程：`xpu-sycl` → https://github.com/lipaul/ltx2.5-xpu-sycl（main）
