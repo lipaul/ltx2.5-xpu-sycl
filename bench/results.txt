@@ -1,0 +1,21 @@
+Reproduce-uv A/B benchmark (B60, distilled pipeline, 768x512, seed 42)
+
+FRAMES=9 smoke run (see baseline.log / blockwise.log for full pipeline logs):
+
+stage      baseline bf16 --offload cpu   blockwise fp8 (no offload)   speedup
+           s/it      total               s/it      total
+stage 1    5.54      43.54s              1.55      11.55s             3.76x
+stage 2    5.39      16s                 3.38      10s                1.60x
+denoising                           59.54s                21.55s      2.76x
+
+Full 33-frame run (earlier, from reproduce_uv_bench.sh with FRAMES=33):
+stage 1   ~6.4-7.3 s/it (~51s)      ~2.4-2.9 s/it (~19s)            ~2.6x
+stage 2   ~9.9-10.1 s/it (~30s)     ~7.8-7.9 s/it (~24s)            ~1.25x
+denoising  ~81s                     ~43s                            ~1.9x
+
+Attribution: the win is memory (fp8 blockwise 22B weights fit on the 24 GB
+B60 -> no --offload cpu weight streaming), not compute (single fp8-linear is
+0.88x vs bf16 due to dequantize; oneDNN bf16 GEMM is already ~95 TFLOPS peak).
+Both modes use the same SDPA flash attention backend.
+
+Regenerate: ./reproduce_uv_bench.sh  (or FRAMES=9 for a quick smoke)

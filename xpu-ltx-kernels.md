@@ -147,7 +147,7 @@ LTX_MODEL_ROOT=/path/to/models ./reproduce_uv_bench.sh
 （XPU torch 钉）→ ③ icpx 构建 `xpu-ltx-kernels` 进 uv venv → ④ 同 prompt/seed/frames
 分别跑 `--offload cpu`（基线）与 `--quantization blockwise`（无 offload）→
 ⑤ 从 tqdm 日志解析每阶段 s/it 与总耗时（自动外推最后一步），打印 speedup 表。
-输出与日志在 `build/bench/`（已 gitignore）。冒烟实测（B60, 9 帧）：
+输出与日志在 `bench/`（`*.mp4` 用 `git add -f` 提交，供比对）。冒烟实测（B60, 9 帧）：
 stage 1 **5.54→1.55 s/it（3.76×）**、stage 2 5.39→3.38 s/it（1.60×）、去噪合计 **2.76×**，
 与 33 帧基准趋势一致。
 

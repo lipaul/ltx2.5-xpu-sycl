@@ -12,7 +12,7 @@
 #   LTX_MODEL_ROOT  model root (default /home/lm/work/models/ltx-2.5)
 #   FRAMES          video frames (default 33; use 9 for a quick smoke test)
 #   SEED            default 42
-#   OUTDIR          output dir for videos/logs (default /tmp/opencode/bench)
+#   OUTDIR          output dir for videos/logs (default <repo>/bench)
 #   MAX_WAIT        seconds to wait per pipeline run (default 900)
 #
 # Requires: uv, icpx (oneAPI 2026.1), an Intel XPU (B60), models in LTX_MODEL_ROOT.
@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_ROOT="${LTX_MODEL_ROOT:-/home/lm/work/models/ltx-2.5}"
 FRAMES="${FRAMES:-33}"
 SEED="${SEED:-42}"
-OUTDIR="${OUTDIR:-/tmp/opencode/bench}"
+OUTDIR="${OUTDIR:-${REPO_ROOT}/bench}"
 MAX_WAIT="${MAX_WAIT:-900}"
 PROMPT="${PROMPT:-A red ball bouncing on a green lawn, camera static.}"
 PY="${REPO_ROOT}/.venv/bin/python"

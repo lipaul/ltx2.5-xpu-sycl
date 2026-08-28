@@ -85,3 +85,4 @@ wandb/
 
 # Binary files
 *.so
+*.pid
