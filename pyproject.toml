@@ -73,6 +73,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Stand-alone CLI whose whole job is printing a utilization report (incl. a
+# Chinese-language report, so full-width CJK punctuation is intentional).
+"bench/xpu_utilization.py" = ["T201", "RUF001"]
 # CI gates: stand-alone CLIs whose whole job is printing a report / GitHub annotations.
 ".github/actions/test-collection-completeness/check_test_collection.py" = ["T201"]
 ".github/actions/golden-pairing-gate/check_golden_pairing.py" = ["T201"]
