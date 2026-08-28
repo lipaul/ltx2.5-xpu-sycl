@@ -151,6 +151,28 @@ LTX_MODEL_ROOT=/path/to/models ./reproduce_uv_bench.sh
 stage 1 **5.54→1.55 s/it（3.76×）**、stage 2 5.39→3.38 s/it（1.60×）、去噪合计 **2.76×**，
 与 33 帧基准趋势一致。
 
+### 独立脚本（uv sync / build / run 三件套）
+
+按步骤单独执行的环境与推理脚本（根目录，均需先 `source /opt/intel/oneapi/setvars.sh`，
+忽略其 rc=3 的 32 位库警告）：
+
+```bash
+# 1) uv sync —— XPU torch 钉（2.13.0+xpu / intel-sycl-rt 2026.0.0）
+./uv_sync.sh
+#    注：uv sync 会卸载 xpu-ltx-kernels（非 workspace 成员），之后必须重跑第 2 步
+
+# 2) 构建 xpu-ltx-kernels 进 uv venv（icpx 编译 + 设备链接）
+./build_xpu_kernels.sh
+
+# 3) XPU blockwise 推理（fp8 块状权重，免 offload；参数转发给 distilled）
+./run_xpu_blockwise.sh "A red ball bouncing on a green lawn, camera static." out.mp4 \
+    --num-frames 33 --seed 42
+#    环境变量 LTX_MODEL_ROOT 覆盖模型根目录（默认 /home/lm/work/models/ltx-2.5）
+```
+
+`reproduce_uv_bench.sh` 是这三者的组合（uv sync + build + 两种模式 A/B + 对比表），
+适合复现基准；单步脚本适合日常迭代。
+
 ## 7. 局限与后续
 
 - **block streaming 不支持 blockwise policy**（`blocks.py` 只放行 bf16/fp8_cast）——
