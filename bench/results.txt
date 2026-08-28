@@ -19,3 +19,10 @@ B60 -> no --offload cpu weight streaming), not compute (single fp8-linear is
 Both modes use the same SDPA flash attention backend.
 
 Regenerate: ./reproduce_uv_bench.sh  (or FRAMES=9 for a quick smoke)
+
+Long-video test (121 frames, ./run_xpu_blockwise.sh):
+- default 768x512 stage-1 -> XPU OOM (fp8 blockwise weights ~22 GB resident on
+  the 24 GB B60 leave ~1.5 GB; 121f activations ~4x the 33f run)
+- --width 512 --height 384 -> OK, 5.04 s clip @24fps with audio
+  (bench/long_test_121f.mp4). Longer clips on 24 GB need fewer tokens
+  (lower res) or offload support for the blockwise policy (see limitations).
